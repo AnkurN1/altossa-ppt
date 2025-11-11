@@ -72,7 +72,7 @@ def show_image_safe(src):
             img = Image.open(io.BytesIO(r.content)).convert("RGB")
         else:
             img = Image.open(s).convert("RGB")
-        st.image(img, use_container_width=True)
+        st.image(img, use_column_width=True)
     except Exception as e:
         st.caption(f"⚠️ Failed to preview image ({src}): {e}")
 # ------------------------------------------------------------------------------
