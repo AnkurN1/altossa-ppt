@@ -56,25 +56,24 @@ def load_manifest():
         t = (r.get("Type") or "").strip()
         urls = [u.strip() for u in (r.get("ImageURLs") or "").split("|") if u.strip()]
         if c and p and t and urls:
+            # store under normalized key
             manifest[(_norm(c), _norm(p), _norm(t))] = urls
     return manifest
 
+
 MANIFEST = load_manifest()
+# ---- CASE-INSENSITIVE + SPACE-NORMALIZED HELPERS ----
+import unicodedata
 from pathlib import Path
 
-def _norm(s):
-    # case-insensitive & collapses multiple spaces
-    return " ".join(str(s or "").strip().split()).lower()
-
-
 def _norm(s: str) -> str:
-    # normalize for matching (case-insensitive + collapse spaces)
-    return " ".join(str(s or "").strip().split()).lower()
+    """lowercase, trim, collapse internal spaces"""
+    s = str(s or "")
+    s = unicodedata.normalize("NFKC", s)
+    return " ".join(s.strip().split()).lower()
 
 def _child_caseless(parent: Path, wanted: str) -> Path | None:
-    """
-    Return the real child path whose name matches `wanted` ignoring case/extra spaces.
-    """
+    """Find child folder ignoring case/extra spaces."""
     wanted_n = _norm(wanted)
     if not parent.exists() or not parent.is_dir():
         return None
@@ -87,10 +86,7 @@ def _child_caseless(parent: Path, wanted: str) -> Path | None:
     return None
 
 def resolve_caseless_path(base_dir: str | Path, *segments: str) -> Path | None:
-    """
-    Walk down the tree matching each segment case-insensitively.
-    Returns the resolved Path or None if not found.
-    """
+    """Walk down a folder tree case-insensitively."""
     cur = Path(base_dir)
     for seg in segments:
         nxt = _child_caseless(cur, seg)
@@ -98,6 +94,7 @@ def resolve_caseless_path(base_dir: str | Path, *segments: str) -> Path | None:
             return None
         cur = nxt
     return cur
+
 
 
 def show_image_safe(src):
@@ -130,18 +127,25 @@ if 'last_temp_key' not in st.session_state:
 # ------------------------------------------------------------------------------
 
 def get_image_list(company, product, ptype):
+    # normalized key
     key_norm = (_norm(company), _norm(product), _norm(ptype))
-    if MANIFEST and key_norm in MANIFEST:
-        return MANIFEST[key_norm]
 
-
-    # Fallback: try a softer match (same company+product, type startswith)
+    # ---- Prefer manifest (URLs) with normalized matching ----
     if MANIFEST:
-        for (c, p, t), urls in MANIFEST.items():
-            if c == key_norm[0] and p == key_norm[1] and t.startswith(key_norm[2][:6]):  # small tolerance
-                return urls
+        # exact normalized match
+        urls = MANIFEST.get(key_norm)
+        if urls:
+            return urls
 
-    # Final fallback: local filesystem (original behavior)
+        # soft fallback: same company+product, type "starts with" or "contains" tolerance
+        # helps if Excel says "ceylon bench" and manifest has "Ceylon Bench (Oak)" etc.
+        for (c, p, t), urls in MANIFEST.items():
+            if c == key_norm[0] and p == key_norm[1]:
+                if t == key_norm[2] or t.startswith(key_norm[2]) or key_norm[2] in t:
+                    return urls
+
+    # ---- Local filesystem fallback (now case-insensitive) ----
+    # Only used if you actually keep images/ directory in the repo/server
     folder = resolve_caseless_path(IMAGE_BASE, company, product, ptype)
     images = []
     if folder and folder.exists():
@@ -149,6 +153,7 @@ def get_image_list(company, product, ptype):
             if file.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp"):
                 images.append(str(file))
     return images
+
 
 
 def get_scaled_dimensions(img, max_width, max_height):
@@ -246,7 +251,7 @@ def create_beautiful_ppt(slide_data_list, include_intro_outro=True):
                 add_path = fetch_to_tempfile(img_src)
                 slide.shapes.add_picture(add_path, Inches(x), Inches(y), width=Inches(img_width), height=Inches(img_height))
 
-        # Logo (original behavior — local 'logo/<Company>/logo.*')
+        # Logo (case-insensitive company folder)
         logo_dir = resolve_caseless_path(LOGO_BASE, company)
         logo_path = None
         if logo_dir and logo_dir.exists():
@@ -293,7 +298,8 @@ if search_query:
     for idx, row in filtered_data.iterrows():
         company, product, ptype, link = row['Company'], row['Product'], row['Type'], row.get('Link', '')
         img_paths = get_image_list(company, product, ptype)
-
+        img_paths = [p for p in img_paths if p and str(p).strip()]
+        
         st.markdown(f"### {product} - {ptype}")
         if len(img_paths) > 0:
             cols = st.columns(min(4, len(img_paths)))
@@ -329,8 +335,10 @@ else:
     for idx, row in filtered_rows.iterrows():
         ptype, link = row['Type'], row.get("Link", "")
         img_paths = get_image_list(company, product, ptype)
+        img_paths = [p for p in img_paths if p and str(p).strip()]
 
         st.markdown(f"### {ptype}")
+        
         if len(img_paths) > 0:
             img_cols = st.columns(min(4, len(img_paths)))
             selected_imgs = st.session_state.temp_selection.get(f"{company}_{product}_{ptype}".replace(" ", "_"), {}).get("images", [])
