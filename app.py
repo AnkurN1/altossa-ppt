@@ -241,7 +241,7 @@ if search_query:
             for i, path in enumerate(img_paths):
                 with cols[i % len(cols)]:
                     # st.image supports both local paths and URLs
-                    st.image(str(path), width="stretch")
+                    st.image(str(path), use_container_width=True)
                     key = f"search_{company}_{product}_{ptype}_{i}".replace(" ", "_")
                     if st.checkbox("Include", key=key):
                         selected_imgs.append(path)
@@ -276,7 +276,7 @@ else:
             selected_imgs = st.session_state.temp_selection.get(f"{company}_{product}_{ptype}".replace(" ", "_"), {}).get("images", [])
             for i, path in enumerate(img_paths):
                 with img_cols[i % len(img_cols)]:
-                    st.image(str(path), width="stretch")  # works for URLs too
+                    st.image(str(path), use_container_width=True)  # works for URLs too
                     key = f"manual_{company}_{product}_{ptype}_{i}".replace(" ", "_")
                     if st.checkbox("Include", key=key):
                         if path not in selected_imgs:
