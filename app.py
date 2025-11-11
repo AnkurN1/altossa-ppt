@@ -17,7 +17,7 @@ data = pd.read_excel("all companys database.xlsx")
 
 # Local fallback bases (original behavior kept)
 IMAGE_BASE = "images"
-LOGO_BASE = "logo"
+LOGO_BASE = "static/logo"
 
 # ------------------------------------------------------------------------------
 # NEW: Optional manifest support (Cloudflare R2)
