@@ -145,8 +145,8 @@ def create_beautiful_ppt(slide_data_list, include_intro_outro=True):
     prs.slide_height = Inches(7.5)
     blank = prs.slide_layouts[6]
     # keep your original first/last paths (you placed 'img/' in the repo)
-    first_slide_path = "img/first.png"
-    last_slide_path = "img/last.png"
+    first_slide_path = "static/img/first.png"
+    last_slide_path = "static/img/last.png"
 
     if include_intro_outro and os.path.exists(first_slide_path):
         slide = prs.slides.add_slide(blank)
