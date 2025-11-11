@@ -67,6 +67,39 @@ def _norm(s):
     return " ".join(str(s or "").strip().split()).lower()
 
 
+def _norm(s: str) -> str:
+    # normalize for matching (case-insensitive + collapse spaces)
+    return " ".join(str(s or "").strip().split()).lower()
+
+def _child_caseless(parent: Path, wanted: str) -> Path | None:
+    """
+    Return the real child path whose name matches `wanted` ignoring case/extra spaces.
+    """
+    wanted_n = _norm(wanted)
+    if not parent.exists() or not parent.is_dir():
+        return None
+    for p in parent.iterdir():
+        try:
+            if p.is_dir() and _norm(p.name) == wanted_n:
+                return p
+        except Exception:
+            continue
+    return None
+
+def resolve_caseless_path(base_dir: str | Path, *segments: str) -> Path | None:
+    """
+    Walk down the tree matching each segment case-insensitively.
+    Returns the resolved Path or None if not found.
+    """
+    cur = Path(base_dir)
+    for seg in segments:
+        nxt = _child_caseless(cur, seg)
+        if nxt is None:
+            return None
+        cur = nxt
+    return cur
+
+
 def show_image_safe(src):
     try:
         s = str(src).strip()
@@ -98,10 +131,9 @@ if 'last_temp_key' not in st.session_state:
 
 def get_image_list(company, product, ptype):
     key_norm = (_norm(company), _norm(product), _norm(ptype))
-
-    # Prefer manifest (URLs)
     if MANIFEST and key_norm in MANIFEST:
         return MANIFEST[key_norm]
+
 
     # Fallback: try a softer match (same company+product, type startswith)
     if MANIFEST:
@@ -110,12 +142,12 @@ def get_image_list(company, product, ptype):
                 return urls
 
     # Final fallback: local filesystem (original behavior)
-    folder = os.path.join(IMAGE_BASE, company, product, ptype)
+    folder = resolve_caseless_path(IMAGE_BASE, company, product, ptype)
     images = []
-    if os.path.exists(folder):
-        for file in os.listdir(folder):
-            if file.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
-                images.append(os.path.join(folder, file))
+    if folder and folder.exists():
+        for file in sorted(folder.iterdir()):
+            if file.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp"):
+                images.append(str(file))
     return images
 
 
@@ -215,14 +247,14 @@ def create_beautiful_ppt(slide_data_list, include_intro_outro=True):
                 slide.shapes.add_picture(add_path, Inches(x), Inches(y), width=Inches(img_width), height=Inches(img_height))
 
         # Logo (original behavior — local 'logo/<Company>/logo.*')
-        logo_dir = os.path.join(LOGO_BASE, company)
+        logo_dir = resolve_caseless_path(LOGO_BASE, company)
         logo_path = None
-        for ext in ['png', 'jpg', 'jpeg']:
-            candidate = os.path.join(logo_dir, f"logo.{ext}")
-            if os.path.exists(candidate):
-                logo_path = candidate
-                break
-        
+        if logo_dir and logo_dir.exists():
+            for ext in (".png", ".jpg", ".jpeg"):
+                cand = logo_dir / f"logo{ext}"
+                if cand.exists():
+                    logo_path = str(cand)
+                    break
         if logo_path:
             slide.shapes.add_picture(logo_path, prs.slide_width - Inches(1.2), Inches(0.1), width=Inches(1.1))
 
