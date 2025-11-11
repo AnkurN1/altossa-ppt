@@ -60,6 +60,21 @@ def load_manifest():
 
 MANIFEST = load_manifest()
 
+def show_image_safe(src):
+    try:
+        s = str(src).strip()
+        if not s:
+            st.caption("⚠️ Empty image reference")
+            return
+        if "://" in s:
+            r = requests.get(s, timeout=30)
+            r.raise_for_status()
+            img = Image.open(io.BytesIO(r.content)).convert("RGB")
+        else:
+            img = Image.open(s).convert("RGB")
+        st.image(img, use_container_width=True)
+    except Exception as e:
+        st.caption(f"⚠️ Failed to preview image ({src}): {e}")
 # ------------------------------------------------------------------------------
 # Session state (UNCHANGED)
 # ------------------------------------------------------------------------------
@@ -241,7 +256,7 @@ if search_query:
             for i, path in enumerate(img_paths):
                 with cols[i % len(cols)]:
                     # st.image supports both local paths and URLs
-                    st.image(str(path), use_container_width=True)
+                    show_image_safe(path)
                     key = f"search_{company}_{product}_{ptype}_{i}".replace(" ", "_")
                     if st.checkbox("Include", key=key):
                         selected_imgs.append(path)
@@ -276,7 +291,7 @@ else:
             selected_imgs = st.session_state.temp_selection.get(f"{company}_{product}_{ptype}".replace(" ", "_"), {}).get("images", [])
             for i, path in enumerate(img_paths):
                 with img_cols[i % len(img_cols)]:
-                    st.image(str(path), use_container_width=True)  # works for URLs too
+                    show_image_safe(path)  # works for URLs too
                     key = f"manual_{company}_{product}_{ptype}_{i}".replace(" ", "_")
                     if st.checkbox("Include", key=key):
                         if path not in selected_imgs:
