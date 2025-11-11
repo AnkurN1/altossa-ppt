@@ -18,7 +18,8 @@ data = pd.read_excel("all companys database.xlsx")
 # Local fallback bases (original behavior kept)
 IMAGE_BASE = "images"
 LOGO_BASE = "static/logo"
-
+FIRST_PATH = Path("static/img/first.png")  # <-- add
+LAST_PATH  = Path("static/img/last.png")
 # ------------------------------------------------------------------------------
 # NEW: Optional manifest support (Cloudflare R2)
 #   - If st.secrets.IMAGE_MANIFEST_URL is set, load from URL
@@ -55,10 +56,16 @@ def load_manifest():
         t = (r.get("Type") or "").strip()
         urls = [u.strip() for u in (r.get("ImageURLs") or "").split("|") if u.strip()]
         if c and p and t and urls:
-            manifest[(c, p, t)] = urls
+            manifest[(_norm(c), _norm(p), _norm(t))] = urls
     return manifest
 
 MANIFEST = load_manifest()
+from pathlib import Path
+
+def _norm(s):
+    # case-insensitive & collapses multiple spaces
+    return " ".join(str(s or "").strip().split()).lower()
+
 
 def show_image_safe(src):
     try:
@@ -90,21 +97,27 @@ if 'last_temp_key' not in st.session_state:
 # ------------------------------------------------------------------------------
 
 def get_image_list(company, product, ptype):
-    """
-    ORIGINAL behavior: read local folder under IMAGE_BASE
-    NEW behavior: if a manifest is present, prefer URLs from manifest.
-    """
-    key = (str(company).strip(), str(product).strip(), str(ptype).strip())
-    if MANIFEST and key in MANIFEST:
-        return MANIFEST[key]  # list of URLs
-    # Fallback to local file system (original)
-    folder = os.path.join(IMAGE_BASE, key[0], key[1], key[2])
+    key_norm = (_norm(company), _norm(product), _norm(ptype))
+
+    # Prefer manifest (URLs)
+    if MANIFEST and key_norm in MANIFEST:
+        return MANIFEST[key_norm]
+
+    # Fallback: try a softer match (same company+product, type startswith)
+    if MANIFEST:
+        for (c, p, t), urls in MANIFEST.items():
+            if c == key_norm[0] and p == key_norm[1] and t.startswith(key_norm[2][:6]):  # small tolerance
+                return urls
+
+    # Final fallback: local filesystem (original behavior)
+    folder = os.path.join(IMAGE_BASE, company, product, ptype)
     images = []
     if os.path.exists(folder):
         for file in os.listdir(folder):
             if file.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
                 images.append(os.path.join(folder, file))
     return images
+
 
 def get_scaled_dimensions(img, max_width, max_height):
     img_width_px, img_height_px = img.size
@@ -145,8 +158,8 @@ def create_beautiful_ppt(slide_data_list, include_intro_outro=True):
     prs.slide_height = Inches(7.5)
     blank = prs.slide_layouts[6]
     # keep your original first/last paths (you placed 'img/' in the repo)
-    first_slide_path = "static/img/first.png"
-    last_slide_path = "static/img/last.png"
+    first_slide_path = str(FIRST_PATH)
+    last_slide_path  = str(LAST_PATH)
 
     if include_intro_outro and os.path.exists(first_slide_path):
         slide = prs.slides.add_slide(blank)
