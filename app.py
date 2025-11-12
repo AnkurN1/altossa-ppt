@@ -4,7 +4,7 @@ from pptx import Presentation
 from pptx.util import Inches, Pt
 from pptx.dml.color import RGBColor
 from PIL import Image
-import os, io, csv, tempfile, requests, unicodedata
+import os, io, csv, tempfile, requests, unicodedata, re
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse, quote
 
@@ -16,6 +16,11 @@ def _norm(s: str) -> str:
     s = str(s or "")
     s = unicodedata.normalize("NFKC", s)
     return " ".join(s.strip().split()).lower()
+
+def _tokens(s: str) -> set[str]:
+    """simple alnum tokenization for fuzzy match"""
+    s = _norm(s)
+    return set(re.findall(r"[a-z0-9]+", s))
 
 def _child_caseless(parent: Path, wanted: str) -> Path | None:
     """Find child dir ignoring case & extra spaces."""
@@ -164,11 +169,50 @@ def load_manifest():
 
 MANIFEST = load_manifest()
 
+# Build quick reverse indexes for fuzzy fallback
+@st.cache_data(show_spinner=False)
+def build_indexes(manifest: dict):
+    """
+    Returns:
+      by_company: {kc: {(kp): {kt: [urls]}}}
+      products_for_company: {kc: set of kp}
+      types_for_cp: {(kc,kp): set of kt}
+    """
+    by_company = {}
+    products_for_company = {}
+    types_for_cp = {}
+    for (kc, kp, kt), urls in manifest.items():
+        by_company.setdefault(kc, {}).setdefault(kp, {}).setdefault(kt, []).extend(urls)
+        products_for_company.setdefault(kc, set()).add(kp)
+        types_for_cp.setdefault((kc, kp), set()).add(kt)
+    return by_company, products_for_company, types_for_cp
+
+BY_COMPANY, PRODUCTS_FOR_COMPANY, TYPES_FOR_CP = build_indexes(MANIFEST)
+
+def _best_token_match(target: str, candidates: set[str]) -> tuple[str | None, float]:
+    """
+    Return (best_candidate, score) by token overlap Jaccard.
+    """
+    if not candidates:
+        return None, 0.0
+    t = _tokens(target)
+    best_c, best_s = None, 0.0
+    for c in candidates:
+        ct = _tokens(c)
+        inter = len(t & ct)
+        union = len(t | ct) if (t or ct) else 1
+        score = inter / union if union else 0.0
+        # small boost if candidate startswith target tokens joined
+        if _norm(c).startswith(_norm(target)):
+            score += 0.15
+        if score > best_s:
+            best_c, best_s = c, score
+    return best_c, best_s
+
 # =========================
-# Image list (manifest first)
+# Image list (manifest first, robust fuzzy)
 # =========================
 def get_image_list(company, product, ptype):
-    # normalized lookup key
     kc, kp, kt = _norm(company), _norm(product), _norm(ptype)
 
     # 1) Exact normalized manifest match
@@ -177,13 +221,28 @@ def get_image_list(company, product, ptype):
         if urls:
             return urls
 
-        # 2) Soft fallback: same company+product, type tolerance
+        # 2) Soft fallback within exact company+product
         for (mc, mp, mt), urls in MANIFEST.items():
             if mc == kc and mp == kp:
                 if mt == kt or mt.startswith(kt) or (kt and kt in mt):
                     return urls
 
-    # 3) Local filesystem fallback (case-insensitive traversal)
+        # 3) Fuzzy: find best product for company, then best type within that product
+        company_block = BY_COMPANY.get(kc)
+        if company_block:
+            # best product match
+            prod_candidates = PRODUCTS_FOR_COMPANY.get(kc, set())
+            best_prod, ps = _best_token_match(kp, prod_candidates)
+            if best_prod:
+                type_candidates = TYPES_FOR_CP.get((kc, best_prod), set())
+                best_type, ts = _best_token_match(kt, type_candidates)
+                # allow reasonable fuzzy matches
+                if best_type and (ts >= 0.25 or _norm(best_type).startswith(kt) or (kt and kt in _norm(best_type))):
+                    urls = BY_COMPANY[kc][best_prod].get(best_type, [])
+                    if urls:
+                        return urls
+
+    # 4) Local filesystem fallback (case-insensitive traversal)
     folder = resolve_caseless_path(IMAGE_BASE, company, product, ptype)
     images = []
     if folder and folder.exists():
