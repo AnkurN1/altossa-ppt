@@ -81,47 +81,100 @@ LOCAL_MANIFEST = BASE_DIR / "image_manifest.csv"
 @st.cache_data(show_spinner=False)
 def load_excel(path: Path) -> pd.DataFrame:
     return pd.read_excel(path)
-
+    
 @st.cache_data(show_spinner=False)
 def load_manifest():
     """
-    Manifest CSV columns:
-      Company, Product, Type, ImageURLs
-    ImageURLs is '|' separated list of absolute URLs.
-    Also registers a swapped (Product<->Type) key to tolerate mismatches
-    between your Excel and CSV layouts.
+    Loads CSV from st.secrets.IMAGE_MANIFEST_URL or local image_manifest.csv.
+    Handles BOM, CRLF/Mac newlines, and auto-detects delimiter.
+    Accepts headers in any case: company/product/type/imageurls.
+    Stores a debug dict in session_state for the Status panel.
     """
     url = (st.secrets.get("IMAGE_MANIFEST_URL", "") or "").strip()
-    rows = []
+    text = ""
+    debug = {
+        "source": "st.secrets URL" if url else ("local image_manifest.csv" if LOCAL_MANIFEST.exists() else "none"),
+        "http_status": None,
+        "text_len": 0,
+        "first_lines": [],
+        "header_fields": [],
+        "row_count": 0,
+        "keys_count": 0,
+        "error": None,
+        "used_delimiter": ",",
+    }
+
     try:
         if url:
             resp = requests.get(url, timeout=30)
+            debug["http_status"] = resp.status_code
             resp.raise_for_status()
-            rows = list(csv.DictReader(resp.text.splitlines()))
+            # decode with BOM handling
+            text = resp.content.decode("utf-8-sig", errors="replace")
         elif LOCAL_MANIFEST.exists():
-            with open(LOCAL_MANIFEST, newline="", encoding="utf-8") as f:
-                rows = list(csv.DictReader(f))
+            with open(LOCAL_MANIFEST, "rb") as f:
+                text = f.read().decode("utf-8-sig", errors="replace")
+        else:
+            st.session_state.manifest_debug = debug
+            return {}
+
+        debug["text_len"] = len(text)
+        debug["first_lines"] = (text.splitlines()[:3] if text else [])
+
+        # Detect delimiter just in case (some editors export ; or \t)
+        sniffer = csv.Sniffer()
+        try:
+            dialect = sniffer.sniff(text.splitlines()[0] if text else "Company,Product,Type,ImageURLs")
+            delimiter = dialect.delimiter
+        except Exception:
+            delimiter = ","
+        debug["used_delimiter"] = delimiter
+
+        reader = csv.DictReader(text.splitlines(), delimiter=delimiter)
+        headers = [h.strip() for h in (reader.fieldnames or [])]
+        debug["header_fields"] = headers
+
+        # Case-insensitive header resolver
+        def get_ci(row, name):
+            for k, v in row.items():
+                if (k or "").strip().lower() == name:
+                    return v
+            return ""
+
+        def _clean_url(u: str) -> str:
+            u = (u or "").strip()
+            if u.lower().endswith((".jpg/", ".jpeg/", ".png/", ".webp/")):
+                u = u[:-1]
+            return u
+
+        manifest = {}
+        row_count = 0
+        for r in reader:
+            row_count += 1
+            c_raw = get_ci(r, "company")
+            p_raw = get_ci(r, "product")
+            t_raw = get_ci(r, "type")
+            urls_raw = get_ci(r, "imageurls")
+
+            c, p, t = _norm(c_raw), _norm(p_raw), _norm(t_raw)
+            urls = [_clean_url(u) for u in (urls_raw or "").split("|") if _clean_url(u)]
+
+            if c and p and t and urls:
+                # main key
+                manifest[(c, p, t)] = urls
+                # tolerant swapped key
+                manifest[(c, t, p)] = urls
+
+        debug["row_count"] = row_count
+        debug["keys_count"] = len(manifest)
+        st.session_state.manifest_debug = debug
+        return manifest
+
     except Exception as e:
+        debug["error"] = str(e)
+        st.session_state.manifest_debug = debug
         st.warning(f"Could not load image manifest: {e}")
-
-    def _clean_url(u: str) -> str:
-        u = (u or "").strip()
-        # strip accidental trailing slash after extension
-        if u.lower().endswith((".jpg/", ".jpeg/", ".png/", ".webp/")):
-            u = u[:-1]
-        return u
-
-    manifest = {}
-    for r in rows:
-        c_raw, p_raw, t_raw = r.get("Company", ""), r.get("Product", ""), r.get("Type", "")
-        c, p, t = _norm(c_raw), _norm(p_raw), _norm(t_raw)
-        urls = [ _clean_url(u) for u in (r.get("ImageURLs") or "").split("|") if _clean_url(u) ]
-        if c and p and t and urls:
-            # main key
-            manifest[(c, p, t)] = urls
-            # tolerant swapped key (handles CSV vs Excel column mismatch)
-            manifest[(c, t, p)] = urls
-    return manifest
+        return {}
 
 
 DATA = load_excel(EXCEL_PATH)
@@ -331,9 +384,20 @@ st.title("Product Selector with Search")
 # Dev/status hints (won't affect UX)
 with st.expander("Status (debug tips)", expanded=False):
     st.write(f"Excel loaded: `{EXCEL_PATH.name}` → {len(DATA)} rows")
-    st.write(f"Manifest source: {'st.secrets URL' if st.secrets.get('IMAGE_MANIFEST_URL') else ('image_manifest.csv' if LOCAL_MANIFEST.exists() else '— none —')}")
-    if MANIFEST:
-        st.write(f"Manifest keys: {len(MANIFEST)}")
+    src = "st.secrets URL" if st.secrets.get("IMAGE_MANIFEST_URL") else ("image_manifest.csv" if LOCAL_MANIFEST.exists() else "— none —")
+    st.write(f"Manifest source: {src}")
+    md = st.session_state.get("manifest_debug", {})
+    if md:
+        st.write(f"HTTP status: {md.get('http_status')}")
+        st.write(f"Downloaded text length: {md.get('text_len')}")
+        st.write(f"CSV delimiter detected: {md.get('used_delimiter')}")
+        st.write(f"Header fields: {md.get('header_fields')}")
+        st.write(f"CSV row count: {md.get('row_count')}")
+        st.write(f"Manifest keys: {md.get('keys_count')}")
+        if md.get("first_lines"):
+            st.code("\n".join(md["first_lines"]), language="text")
+        if md.get("error"):
+            st.error(f"Manifest error: {md['error']}")
 
 search_query = st.text_input("Search by Type", "")
 
