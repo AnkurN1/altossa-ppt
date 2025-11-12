@@ -6,11 +6,115 @@ from pptx.dml.color import RGBColor
 from PIL import Image
 import os
 
-# Load data
+# NEW: minimal helpers for URL support
+import requests, io, tempfile, csv
+from pathlib import Path
+
+# ------------------------------------------------------------------------------
+# Load data (UNCHANGED path — keep your Excel beside app.py)
+# ------------------------------------------------------------------------------
 data = pd.read_excel("all companys database.xlsx")
+
+# Local fallback bases (original behavior kept)
 IMAGE_BASE = "images"
 LOGO_BASE = "static/logo"
+FIRST_PATH = Path("static/img/first.png")  # <-- add
+LAST_PATH  = Path("static/img/last.png")
+# ------------------------------------------------------------------------------
+# NEW: Optional manifest support (Cloudflare R2)
+#   - If st.secrets.IMAGE_MANIFEST_URL is set, load from URL
+#   - Else if image_manifest.csv exists locally, load it
+#   - Else fall back to local folders under IMAGE_BASE
+# ------------------------------------------------------------------------------
+BASE_DIR = Path(__file__).parent
+LOCAL_MANIFEST = BASE_DIR / "image_manifest.csv"
 
+@st.cache_data(show_spinner=False)
+def load_manifest():
+    """
+    Manifest CSV columns: Company,Product,Type,ImageURLs
+    ImageURLs is '|' separated list of absolute URLs (R2 public links)
+    """
+    url = (st.secrets.get("IMAGE_MANIFEST_URL", "") or "").strip()
+    rows = []
+    try:
+        if url:
+            txt = requests.get(url, timeout=30).text.splitlines()
+            reader = csv.DictReader(txt)
+            rows = list(reader)
+        elif LOCAL_MANIFEST.exists():
+            with open(LOCAL_MANIFEST, newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                rows = list(reader)
+    except Exception:
+        rows = []
+
+    manifest = {}
+    for r in rows:
+        c = (r.get("Company") or "").strip()
+        p = (r.get("Product") or "").strip()
+        t = (r.get("Type") or "").strip()
+        urls = [u.strip() for u in (r.get("ImageURLs") or "").split("|") if u.strip()]
+        if c and p and t and urls:
+            # store under normalized key
+            manifest[(_norm(c), _norm(p), _norm(t))] = urls
+    return manifest
+
+
+MANIFEST = load_manifest()
+# ---- CASE-INSENSITIVE + SPACE-NORMALIZED HELPERS ----
+import unicodedata
+from pathlib import Path
+
+def _norm(s: str) -> str:
+    """lowercase, trim, collapse internal spaces"""
+    s = str(s or "")
+    s = unicodedata.normalize("NFKC", s)
+    return " ".join(s.strip().split()).lower()
+
+def _child_caseless(parent: Path, wanted: str) -> Path | None:
+    """Find child folder ignoring case/extra spaces."""
+    wanted_n = _norm(wanted)
+    if not parent.exists() or not parent.is_dir():
+        return None
+    for p in parent.iterdir():
+        try:
+            if p.is_dir() and _norm(p.name) == wanted_n:
+                return p
+        except Exception:
+            continue
+    return None
+
+def resolve_caseless_path(base_dir: str | Path, *segments: str) -> Path | None:
+    """Walk down a folder tree case-insensitively."""
+    cur = Path(base_dir)
+    for seg in segments:
+        nxt = _child_caseless(cur, seg)
+        if nxt is None:
+            return None
+        cur = nxt
+    return cur
+
+
+
+def show_image_safe(src):
+    try:
+        s = str(src).strip()
+        if not s:
+            st.caption("⚠️ Empty image reference")
+            return
+        if "://" in s:
+            r = requests.get(s, timeout=30)
+            r.raise_for_status()
+            img = Image.open(io.BytesIO(r.content)).convert("RGB")
+        else:
+            img = Image.open(s).convert("RGB")
+        st.image(img, use_column_width=True)
+    except Exception as e:
+        st.caption(f"⚠️ Failed to preview image ({src}): {e}")
+# ------------------------------------------------------------------------------
+# Session state (UNCHANGED)
+# ------------------------------------------------------------------------------
 if 'ppt_items' not in st.session_state:
     st.session_state.ppt_items = {}
 if 'temp_selection' not in st.session_state:
@@ -18,15 +122,39 @@ if 'temp_selection' not in st.session_state:
 if 'last_temp_key' not in st.session_state:
     st.session_state.last_temp_key = None
 
+# ------------------------------------------------------------------------------
 # Utility functions
+# ------------------------------------------------------------------------------
+
 def get_image_list(company, product, ptype):
-    folder = os.path.join(IMAGE_BASE, str(company).strip(), str(product).strip(), str(ptype).strip())
+    # normalized key
+    key_norm = (_norm(company), _norm(product), _norm(ptype))
+
+    # ---- Prefer manifest (URLs) with normalized matching ----
+    if MANIFEST:
+        # exact normalized match
+        urls = MANIFEST.get(key_norm)
+        if urls:
+            return urls
+
+        # soft fallback: same company+product, type "starts with" or "contains" tolerance
+        # helps if Excel says "ceylon bench" and manifest has "Ceylon Bench (Oak)" etc.
+        for (c, p, t), urls in MANIFEST.items():
+            if c == key_norm[0] and p == key_norm[1]:
+                if t == key_norm[2] or t.startswith(key_norm[2]) or key_norm[2] in t:
+                    return urls
+
+    # ---- Local filesystem fallback (now case-insensitive) ----
+    # Only used if you actually keep images/ directory in the repo/server
+    folder = resolve_caseless_path(IMAGE_BASE, company, product, ptype)
     images = []
-    if os.path.exists(folder):
-        for file in os.listdir(folder):
-            if file.lower().endswith(('.jpg', '.jpeg', '.png')):
-                images.append(os.path.join(folder, file))
+    if folder and folder.exists():
+        for file in sorted(folder.iterdir()):
+            if file.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp"):
+                images.append(str(file))
     return images
+
+
 
 def get_scaled_dimensions(img, max_width, max_height):
     img_width_px, img_height_px = img.size
@@ -40,13 +168,35 @@ def get_scaled_dimensions(img, max_width, max_height):
         width = height * aspect_ratio
     return width, height
 
+# NEW: open image from URL or local path for dimension calculation
+def open_pil_image(path_or_url):
+    if "://" in str(path_or_url):
+        resp = requests.get(path_or_url, timeout=60)
+        resp.raise_for_status()
+        return Image.open(io.BytesIO(resp.content))
+    return Image.open(path_or_url)
+
+# NEW: for python-pptx add_picture() which needs a path/stream; easiest is temp file
+def fetch_to_tempfile(path_or_url):
+    if "://" not in str(path_or_url):
+        return path_or_url
+    resp = requests.get(path_or_url, timeout=60)
+    resp.raise_for_status()
+    # infer ext from URL
+    ext = ".png" if path_or_url.lower().endswith(".png") else ".jpg"
+    fd, tpath = tempfile.mkstemp(suffix=ext)
+    with os.fdopen(fd, "wb") as f:
+        f.write(resp.content)
+    return tpath
+
 def create_beautiful_ppt(slide_data_list, include_intro_outro=True):
     prs = Presentation()
     prs.slide_width = Inches(13.33)
     prs.slide_height = Inches(7.5)
     blank = prs.slide_layouts[6]
-    first_slide_path = "static/img/first.png"
-    last_slide_path = "static/img/last.png"
+    # keep your original first/last paths (you placed 'img/' in the repo)
+    first_slide_path = str(FIRST_PATH)
+    last_slide_path  = str(LAST_PATH)
 
     if include_intro_outro and os.path.exists(first_slide_path):
         slide = prs.slides.add_slide(blank)
@@ -84,23 +234,32 @@ def create_beautiful_ppt(slide_data_list, include_intro_outro=True):
             cell_width = available_width / columns
             cell_height = available_height / rows
 
-            for i, img_path in enumerate(imgs):
+            for i, img_src in enumerate(imgs):
                 row = i // columns
                 col = i % columns
-                with Image.open(img_path) as img:
-                    img_width, img_height = get_scaled_dimensions(img, max_width=cell_width, max_height=cell_height)
-                    x = padding + col * (cell_width + padding) + (cell_width - img_width) / 2
-                    y = y_img_top + row * (cell_height + padding) + (cell_height - img_height) / 2
-                    slide.shapes.add_picture(img_path, Inches(x), Inches(y), width=Inches(img_width), height=Inches(img_height))
+                # open PIL image from URL or path (for sizing only)
+                try:
+                    with open_pil_image(img_src) as img:
+                        img_width, img_height = get_scaled_dimensions(img, max_width=cell_width, max_height=cell_height)
+                except Exception:
+                    # If PIL fails, default fit box to avoid crash
+                    img_width, img_height = cell_width, cell_height
 
-        logo_dir = os.path.join(LOGO_BASE, company)
+                x = padding + col * (cell_width + padding) + (cell_width - img_width) / 2
+                y = y_img_top + row * (cell_height + padding) + (cell_height - img_height) / 2
+                # ensure python-pptx gets a local path
+                add_path = fetch_to_tempfile(img_src)
+                slide.shapes.add_picture(add_path, Inches(x), Inches(y), width=Inches(img_width), height=Inches(img_height))
+
+        # Logo (case-insensitive company folder)
+        logo_dir = resolve_caseless_path(LOGO_BASE, company)
         logo_path = None
-        for ext in ['png', 'jpg', 'jpeg']:
-            candidate = os.path.join(logo_dir, f"logo.{ext}")
-            if os.path.exists(candidate):
-                logo_path = candidate
-                break
-        
+        if logo_dir and logo_dir.exists():
+            for ext in (".png", ".jpg", ".jpeg"):
+                cand = logo_dir / f"logo{ext}"
+                if cand.exists():
+                    logo_path = str(cand)
+                    break
         if logo_path:
             slide.shapes.add_picture(logo_path, prs.slide_width - Inches(1.2), Inches(0.1), width=Inches(1.1))
 
@@ -125,7 +284,9 @@ def create_beautiful_ppt(slide_data_list, include_intro_outro=True):
 
     return prs
 
-# UI
+# ------------------------------------------------------------------------------
+# UI (UNCHANGED)
+# ------------------------------------------------------------------------------
 st.title("Product Selector with Search")
 search_query = st.text_input("Search by Type", "")
 
@@ -137,14 +298,16 @@ if search_query:
     for idx, row in filtered_data.iterrows():
         company, product, ptype, link = row['Company'], row['Product'], row['Type'], row.get('Link', '')
         img_paths = get_image_list(company, product, ptype)
-
+        img_paths = [p for p in img_paths if p and str(p).strip()]
+        
         st.markdown(f"### {product} - {ptype}")
         if len(img_paths) > 0:
             cols = st.columns(min(4, len(img_paths)))
             selected_imgs = []
             for i, path in enumerate(img_paths):
                 with cols[i % len(cols)]:
-                    st.image(path, use_container_width=True)
+                    # st.image supports both local paths and URLs
+                    show_image_safe(path)
                     key = f"search_{company}_{product}_{ptype}_{i}".replace(" ", "_")
                     if st.checkbox("Include", key=key):
                         selected_imgs.append(path)
@@ -172,14 +335,16 @@ else:
     for idx, row in filtered_rows.iterrows():
         ptype, link = row['Type'], row.get("Link", "")
         img_paths = get_image_list(company, product, ptype)
+        img_paths = [p for p in img_paths if p and str(p).strip()]
 
         st.markdown(f"### {ptype}")
+        
         if len(img_paths) > 0:
             img_cols = st.columns(min(4, len(img_paths)))
             selected_imgs = st.session_state.temp_selection.get(f"{company}_{product}_{ptype}".replace(" ", "_"), {}).get("images", [])
             for i, path in enumerate(img_paths):
                 with img_cols[i % len(img_cols)]:
-                    st.image(path, use_container_width=True)
+                    show_image_safe(path)  # works for URLs too
                     key = f"manual_{company}_{product}_{ptype}_{i}".replace(" ", "_")
                     if st.checkbox("Include", key=key):
                         if path not in selected_imgs:
@@ -198,7 +363,7 @@ else:
         if v['images']:
             st.session_state.ppt_items[f"{v['company']}_{v['product']}_{v['ptype']}"] = v
 
-# Sidebar generate PPTs
+# Sidebar generate PPTs (UNCHANGED)
 with st.sidebar:
     st.markdown("## Ready to Download")
 
@@ -225,4 +390,9 @@ with st.sidebar:
 
     if st.session_state.ppt_ready and st.session_state.ppt_path and os.path.exists(st.session_state.ppt_path):
         with open(st.session_state.ppt_path, "rb") as f:
-            st.download_button("Download Combined PPT", f, file_name="combined_presentation.pptx", mime="application/vnd.openxmlformats-officedocument.presentationml.presentation")
+            st.download_button(
+                "Download Combined PPT",
+                f,
+                file_name="combined_presentation.pptx",
+                mime="application/vnd.openxmlformats-officedocument.presentationml.presentation"
+            )
