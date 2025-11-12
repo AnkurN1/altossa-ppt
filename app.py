@@ -4,137 +4,31 @@ from pptx import Presentation
 from pptx.util import Inches, Pt
 from pptx.dml.color import RGBColor
 from PIL import Image
-import os, io, csv, tempfile, requests, unicodedata, re
+import os
+
+# NEW: minimal helpers for URL support
+import requests, io, tempfile, csv
 from pathlib import Path
-from urllib.parse import urlparse, urlunparse, quote
 
-# =========================
-# Small, safe helpers first
-# =========================
-def _norm(s: str) -> str:
-    """normalize unicode, trim, collapse spaces, lowercase"""
-    s = str(s or "")
-    s = unicodedata.normalize("NFKC", s)
-    return " ".join(s.strip().split()).lower()
+# ------------------------------------------------------------------------------
+# Load data (UNCHANGED path — keep your Excel beside app.py)
+# ------------------------------------------------------------------------------
+data = pd.read_excel("all companys database.xlsx")
 
-def _tokens(s: str) -> set[str]:
-    """simple alnum tokenization for fuzzy match"""
-    s = _norm(s)
-    return set(re.findall(r"[a-z0-9]+", s))
-
-def _child_caseless(parent: Path, wanted: str) -> Path | None:
-    """Find child dir ignoring case & extra spaces."""
-    wanted_n = _norm(wanted)
-    if not parent.exists() or not parent.is_dir():
-        return None
-    for p in parent.iterdir():
-        try:
-            if p.is_dir() and _norm(p.name) == wanted_n:
-                return p
-        except Exception:
-            continue
-    return None
-
-def resolve_caseless_path(base_dir: str | Path, *segments: str) -> Path | None:
-    """Walk a folder tree ignoring case/spaces for each segment."""
-    cur = Path(base_dir)
-    for seg in segments:
-        nxt = _child_caseless(cur, seg)
-        if nxt is None:
-            return None
-        cur = nxt
-    return cur
-
-def _fix_r2_url(u: str) -> str:
-    """
-    For r2.dev URLs, percent-encode each path segment.
-    DO NOT inject bucket. Works with bucket-scoped public dev domains:
-      https://pub-<id>.r2.dev/images/...
-    """
-    s = str(u or "").strip()
-    if not s:
-        return s
-    try:
-        pr = urlparse(s)
-        if ".r2.dev" not in pr.netloc:
-            return s  # leave non-R2 links untouched
-        parts = [p for p in pr.path.split("/") if p]
-        path_enc = "/" + "/".join(quote(p, safe="")) if parts else "/"
-        return urlunparse((pr.scheme, pr.netloc, path_enc, pr.params, pr.query, pr.fragment))
-    except Exception:
-        return s
-
-def show_image_safe(src):
-    """Preview image safely from URL or local path (keeps your UI)."""
-    try:
-        s = str(src).strip()
-        if not s:
-            st.caption("⚠️ Empty image reference")
-            return
-        if "://" in s:
-            s = _fix_r2_url(s)
-            r = requests.get(s, timeout=30)
-            r.raise_for_status()
-            img = Image.open(io.BytesIO(r.content)).convert("RGB")
-        else:
-            img = Image.open(s).convert("RGB")
-        st.image(img, use_container_width=True)
-    except Exception as e:
-        st.caption(f"⚠️ Failed to preview image ({src}): {e}")
-
-def fetch_to_tempfile(path_or_url: str) -> str:
-    """Return local path for python-pptx: download if URL, else pass-through."""
-    if "://" not in str(path_or_url):
-        return path_or_url
-    path_or_url = _fix_r2_url(str(path_or_url))
-    resp = requests.get(path_or_url, timeout=60)
-    resp.raise_for_status()
-    ext = ".png" if path_or_url.lower().endswith(".png") else ".jpg"
-    fd, tpath = tempfile.mkstemp(suffix=ext)
-    with os.fdopen(fd, "wb") as f:
-        f.write(resp.content)
-    return tpath
-
-# =========================
-# Constants / paths (as-is)
-# =========================
-IMAGE_BASE = "images"              # optional local fallback
-LOGO_BASE  = "static/logo"         # your logo repo path
-FIRST_PATH = Path("static/img/first.png")
+# Local fallback bases (original behavior kept)
+IMAGE_BASE = "images"
+LOGO_BASE = "static/logo"
+FIRST_PATH = Path("static/img/first.png")  # <-- add
 LAST_PATH  = Path("static/img/last.png")
-
+# ------------------------------------------------------------------------------
+# NEW: Optional manifest support (Cloudflare R2)
+#   - If st.secrets.IMAGE_MANIFEST_URL is set, load from URL
+#   - Else if image_manifest.csv exists locally, load it
+#   - Else fall back to local folders under IMAGE_BASE
+# ------------------------------------------------------------------------------
 BASE_DIR = Path(__file__).parent
 LOCAL_MANIFEST = BASE_DIR / "image_manifest.csv"
 
-# =========================
-# Excel loader (robust)
-# =========================
-@st.cache_data(show_spinner=False)
-def load_excel():
-    ex_url = (st.secrets.get("EXCEL_URL", "") or "").strip()
-    candidates = [
-        "all companys database.xlsx",
-        os.path.join("data", "all companys database.xlsx"),
-        ex_url if ex_url else None,
-    ]
-    for path in candidates:
-        if not path:
-            continue
-        try:
-            if isinstance(path, str) and path.startswith("http"):
-                return pd.read_excel(path)
-            if os.path.exists(path):
-                return pd.read_excel(path)
-        except Exception:
-            continue
-    st.error("Missing Excel: place 'all companys database.xlsx' next to app.py or set EXCEL_URL in Secrets.")
-    st.stop()
-
-data = load_excel()
-
-# =========================
-# Manifest loader (normalized)
-# =========================
 @st.cache_data(show_spinner=False)
 def load_manifest():
     """
@@ -161,88 +55,97 @@ def load_manifest():
         p = (r.get("Product") or "").strip()
         t = (r.get("Type") or "").strip()
         urls = [u.strip() for u in (r.get("ImageURLs") or "").split("|") if u.strip()]
-        if not (c and p and t and urls):
-            continue
-        key = (_norm(c), _norm(p), _norm(t))
-        manifest.setdefault(key, []).extend(urls)  # aggregate duplicates safely
+        if c and p and t and urls:
+            # store under normalized key
+            manifest[(_norm(c), _norm(p), _norm(t))] = urls
     return manifest
 
+
 MANIFEST = load_manifest()
+# ---- CASE-INSENSITIVE + SPACE-NORMALIZED HELPERS ----
+import unicodedata
+from pathlib import Path
 
-# Build quick reverse indexes for fuzzy fallback
-@st.cache_data(show_spinner=False)
-def build_indexes(manifest: dict):
-    """
-    Returns:
-      by_company: {kc: {(kp): {kt: [urls]}}}
-      products_for_company: {kc: set of kp}
-      types_for_cp: {(kc,kp): set of kt}
-    """
-    by_company = {}
-    products_for_company = {}
-    types_for_cp = {}
-    for (kc, kp, kt), urls in manifest.items():
-        by_company.setdefault(kc, {}).setdefault(kp, {}).setdefault(kt, []).extend(urls)
-        products_for_company.setdefault(kc, set()).add(kp)
-        types_for_cp.setdefault((kc, kp), set()).add(kt)
-    return by_company, products_for_company, types_for_cp
+def _norm(s: str) -> str:
+    """lowercase, trim, collapse internal spaces"""
+    s = str(s or "")
+    s = unicodedata.normalize("NFKC", s)
+    return " ".join(s.strip().split()).lower()
 
-BY_COMPANY, PRODUCTS_FOR_COMPANY, TYPES_FOR_CP = build_indexes(MANIFEST)
+def _child_caseless(parent: Path, wanted: str) -> Path | None:
+    """Find child folder ignoring case/extra spaces."""
+    wanted_n = _norm(wanted)
+    if not parent.exists() or not parent.is_dir():
+        return None
+    for p in parent.iterdir():
+        try:
+            if p.is_dir() and _norm(p.name) == wanted_n:
+                return p
+        except Exception:
+            continue
+    return None
 
-def _best_token_match(target: str, candidates: set[str]) -> tuple[str | None, float]:
-    """
-    Return (best_candidate, score) by token overlap Jaccard.
-    """
-    if not candidates:
-        return None, 0.0
-    t = _tokens(target)
-    best_c, best_s = None, 0.0
-    for c in candidates:
-        ct = _tokens(c)
-        inter = len(t & ct)
-        union = len(t | ct) if (t or ct) else 1
-        score = inter / union if union else 0.0
-        # small boost if candidate startswith target tokens joined
-        if _norm(c).startswith(_norm(target)):
-            score += 0.15
-        if score > best_s:
-            best_c, best_s = c, score
-    return best_c, best_s
+def resolve_caseless_path(base_dir: str | Path, *segments: str) -> Path | None:
+    """Walk down a folder tree case-insensitively."""
+    cur = Path(base_dir)
+    for seg in segments:
+        nxt = _child_caseless(cur, seg)
+        if nxt is None:
+            return None
+        cur = nxt
+    return cur
 
-# =========================
-# Image list (manifest first, robust fuzzy)
-# =========================
+
+
+def show_image_safe(src):
+    try:
+        s = str(src).strip()
+        if not s:
+            st.caption("⚠️ Empty image reference")
+            return
+        if "://" in s:
+            r = requests.get(s, timeout=30)
+            r.raise_for_status()
+            img = Image.open(io.BytesIO(r.content)).convert("RGB")
+        else:
+            img = Image.open(s).convert("RGB")
+        st.image(img, use_column_width=True)
+    except Exception as e:
+        st.caption(f"⚠️ Failed to preview image ({src}): {e}")
+# ------------------------------------------------------------------------------
+# Session state (UNCHANGED)
+# ------------------------------------------------------------------------------
+if 'ppt_items' not in st.session_state:
+    st.session_state.ppt_items = {}
+if 'temp_selection' not in st.session_state:
+    st.session_state.temp_selection = {}
+if 'last_temp_key' not in st.session_state:
+    st.session_state.last_temp_key = None
+
+# ------------------------------------------------------------------------------
+# Utility functions
+# ------------------------------------------------------------------------------
+
 def get_image_list(company, product, ptype):
-    kc, kp, kt = _norm(company), _norm(product), _norm(ptype)
+    # normalized key
+    key_norm = (_norm(company), _norm(product), _norm(ptype))
 
-    # 1) Exact normalized manifest match
+    # ---- Prefer manifest (URLs) with normalized matching ----
     if MANIFEST:
-        urls = MANIFEST.get((kc, kp, kt))
+        # exact normalized match
+        urls = MANIFEST.get(key_norm)
         if urls:
             return urls
 
-        # 2) Soft fallback within exact company+product
-        for (mc, mp, mt), urls in MANIFEST.items():
-            if mc == kc and mp == kp:
-                if mt == kt or mt.startswith(kt) or (kt and kt in mt):
+        # soft fallback: same company+product, type "starts with" or "contains" tolerance
+        # helps if Excel says "ceylon bench" and manifest has "Ceylon Bench (Oak)" etc.
+        for (c, p, t), urls in MANIFEST.items():
+            if c == key_norm[0] and p == key_norm[1]:
+                if t == key_norm[2] or t.startswith(key_norm[2]) or key_norm[2] in t:
                     return urls
 
-        # 3) Fuzzy: find best product for company, then best type within that product
-        company_block = BY_COMPANY.get(kc)
-        if company_block:
-            # best product match
-            prod_candidates = PRODUCTS_FOR_COMPANY.get(kc, set())
-            best_prod, ps = _best_token_match(kp, prod_candidates)
-            if best_prod:
-                type_candidates = TYPES_FOR_CP.get((kc, best_prod), set())
-                best_type, ts = _best_token_match(kt, type_candidates)
-                # allow reasonable fuzzy matches
-                if best_type and (ts >= 0.25 or _norm(best_type).startswith(kt) or (kt and kt in _norm(best_type))):
-                    urls = BY_COMPANY[kc][best_prod].get(best_type, [])
-                    if urls:
-                        return urls
-
-    # 4) Local filesystem fallback (case-insensitive traversal)
+    # ---- Local filesystem fallback (now case-insensitive) ----
+    # Only used if you actually keep images/ directory in the repo/server
     folder = resolve_caseless_path(IMAGE_BASE, company, product, ptype)
     images = []
     if folder and folder.exists():
@@ -251,9 +154,8 @@ def get_image_list(company, product, ptype):
                 images.append(str(file))
     return images
 
-# =========================
-# PPT builder (unchanged UI)
-# =========================
+
+
 def get_scaled_dimensions(img, max_width, max_height):
     img_width_px, img_height_px = img.size
     aspect_ratio = img_width_px / img_height_px
@@ -266,20 +168,33 @@ def get_scaled_dimensions(img, max_width, max_height):
         width = height * aspect_ratio
     return width, height
 
+# NEW: open image from URL or local path for dimension calculation
 def open_pil_image(path_or_url):
     if "://" in str(path_or_url):
-        path_or_url = _fix_r2_url(str(path_or_url))
         resp = requests.get(path_or_url, timeout=60)
         resp.raise_for_status()
         return Image.open(io.BytesIO(resp.content))
     return Image.open(path_or_url)
+
+# NEW: for python-pptx add_picture() which needs a path/stream; easiest is temp file
+def fetch_to_tempfile(path_or_url):
+    if "://" not in str(path_or_url):
+        return path_or_url
+    resp = requests.get(path_or_url, timeout=60)
+    resp.raise_for_status()
+    # infer ext from URL
+    ext = ".png" if path_or_url.lower().endswith(".png") else ".jpg"
+    fd, tpath = tempfile.mkstemp(suffix=ext)
+    with os.fdopen(fd, "wb") as f:
+        f.write(resp.content)
+    return tpath
 
 def create_beautiful_ppt(slide_data_list, include_intro_outro=True):
     prs = Presentation()
     prs.slide_width = Inches(13.33)
     prs.slide_height = Inches(7.5)
     blank = prs.slide_layouts[6]
-
+    # keep your original first/last paths (you placed 'img/' in the repo)
     first_slide_path = str(FIRST_PATH)
     last_slide_path  = str(LAST_PATH)
 
@@ -327,6 +242,7 @@ def create_beautiful_ppt(slide_data_list, include_intro_outro=True):
                     with open_pil_image(img_src) as img:
                         img_width, img_height = get_scaled_dimensions(img, max_width=cell_width, max_height=cell_height)
                 except Exception:
+                    # If PIL fails, default fit box to avoid crash
                     img_width, img_height = cell_width, cell_height
 
                 x = padding + col * (cell_width + padding) + (cell_width - img_width) / 2
@@ -368,18 +284,12 @@ def create_beautiful_ppt(slide_data_list, include_intro_outro=True):
 
     return prs
 
-# =========================
-# UI (unchanged)
-# =========================
+# ------------------------------------------------------------------------------
+# UI (UNCHANGED)
+# ------------------------------------------------------------------------------
 st.title("Product Selector with Search")
 search_query = st.text_input("Search by Type", "")
 
-if 'ppt_items' not in st.session_state:
-    st.session_state.ppt_items = {}
-if 'temp_selection' not in st.session_state:
-    st.session_state.temp_selection = {}
-if 'last_temp_key' not in st.session_state:
-    st.session_state.last_temp_key = None
 if 'search_selection_keys' not in st.session_state:
     st.session_state.search_selection_keys = set()
 
@@ -389,13 +299,14 @@ if search_query:
         company, product, ptype, link = row['Company'], row['Product'], row['Type'], row.get('Link', '')
         img_paths = get_image_list(company, product, ptype)
         img_paths = [p for p in img_paths if p and str(p).strip()]
-
+        
         st.markdown(f"### {product} - {ptype}")
         if len(img_paths) > 0:
             cols = st.columns(min(4, len(img_paths)))
             selected_imgs = []
             for i, path in enumerate(img_paths):
                 with cols[i % len(cols)]:
+                    # st.image supports both local paths and URLs
                     show_image_safe(path)
                     key = f"search_{company}_{product}_{ptype}_{i}".replace(" ", "_")
                     if st.checkbox("Include", key=key):
@@ -427,12 +338,13 @@ else:
         img_paths = [p for p in img_paths if p and str(p).strip()]
 
         st.markdown(f"### {ptype}")
+        
         if len(img_paths) > 0:
             img_cols = st.columns(min(4, len(img_paths)))
             selected_imgs = st.session_state.temp_selection.get(f"{company}_{product}_{ptype}".replace(" ", "_"), {}).get("images", [])
             for i, path in enumerate(img_paths):
                 with img_cols[i % len(img_cols)]:
-                    show_image_safe(path)
+                    show_image_safe(path)  # works for URLs too
                     key = f"manual_{company}_{product}_{ptype}_{i}".replace(" ", "_")
                     if st.checkbox("Include", key=key):
                         if path not in selected_imgs:
@@ -451,7 +363,7 @@ else:
         if v['images']:
             st.session_state.ppt_items[f"{v['company']}_{v['product']}_{v['ptype']}"] = v
 
-# Sidebar generate PPTs (unchanged)
+# Sidebar generate PPTs (UNCHANGED)
 with st.sidebar:
     st.markdown("## Ready to Download")
 
