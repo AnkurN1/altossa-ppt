@@ -130,11 +130,11 @@ def load_manifest():
             manifest[(c, t, p)] = urls
     return manifest
 
-    except Exception as e:
-        debug["error"] = str(e)
-        st.session_state.manifest_debug = debug
-        st.warning(f"Could not load image manifest: {e}")
-        return {}
+    # except Exception as e:
+    #     debug["error"] = str(e)
+    #     st.session_state.manifest_debug = debug
+    #     st.warning(f"Could not load image manifest: {e}")
+    #     return {}
 
 
 DATA = load_excel(EXCEL_PATH)
