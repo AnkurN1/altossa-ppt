@@ -15,11 +15,12 @@ from pathlib import Path
 # ------------------------------------------------------------------------------
 data = pd.read_excel("all companys database.xlsx")
 
+
 # Local fallback bases (original behavior kept)
 IMAGE_BASE = "images"
-LOGO_BASE = "static/logo"
-FIRST_PATH = Path("static/img/first.png")  # <-- add
-LAST_PATH  = Path("static/img/last.png")
+LOGO_BASE = "logo"
+FIRST_PATH = "img/first.png"  # <-- add
+LAST_PATH  = "img/last.png"
 # ------------------------------------------------------------------------------
 # NEW: Optional manifest support (Cloudflare R2)
 #   - If st.secrets.IMAGE_MANIFEST_URL is set, load from URL
@@ -29,48 +30,22 @@ LAST_PATH  = Path("static/img/last.png")
 BASE_DIR = Path(__file__).parent
 LOCAL_MANIFEST = BASE_DIR / "image_manifest.csv"
 
-@st.cache_data(show_spinner=False)
-def load_manifest():
-    """
-    Manifest CSV columns: Company,Product,Type,ImageURLs
-    ImageURLs is '|' separated list of absolute URLs (R2 public links)
-    """
-    url = (st.secrets.get("IMAGE_MANIFEST_URL", "") or "").strip()
-    rows = []
-    try:
-        if url:
-            txt = requests.get(url, timeout=30).text.splitlines()
-            reader = csv.DictReader(txt)
-            rows = list(reader)
-        elif LOCAL_MANIFEST.exists():
-            with open(LOCAL_MANIFEST, newline="", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                rows = list(reader)
-    except Exception:
-        rows = []
 
-    manifest = {}
-    for r in rows:
-        c = (r.get("Company") or "").strip()
-        p = (r.get("Product") or "").strip()
-        t = (r.get("Type") or "").strip()
-        urls = [u.strip() for u in (r.get("ImageURLs") or "").split("|") if u.strip()]
-        if c and p and t and urls:
-            # store under normalized key
-            manifest[(_norm(c), _norm(p), _norm(t))] = urls
-    return manifest
-
-
-MANIFEST = load_manifest()
-# ---- CASE-INSENSITIVE + SPACE-NORMALIZED HELPERS ----
 import unicodedata
 from pathlib import Path
+
+
 
 def _norm(s: str) -> str:
     """lowercase, trim, collapse internal spaces"""
     s = str(s or "")
     s = unicodedata.normalize("NFKC", s)
     return " ".join(s.strip().split()).lower()
+
+def _tokens(s: str) -> set:
+    s = _norm(s).replace("-", " ").replace("_", " ")
+    return set([t for t in s.split() if t])
+
 
 def _child_caseless(parent: Path, wanted: str) -> Path | None:
     """Find child folder ignoring case/extra spaces."""
@@ -112,6 +87,71 @@ def show_image_safe(src):
         st.image(img, use_column_width=True)
     except Exception as e:
         st.caption(f"⚠️ Failed to preview image ({src}): {e}")
+
+@st.cache_data(show_spinner=False)
+def load_manifest():
+    """
+    Manifest CSV columns: Company,Product,Type,ImageURLs
+    - Accepts any header case (company/product/type/imageurls)
+    - Handles BOM & delimiter sniffing
+    - Cleans accidental trailing '.jpg/' etc.
+    - Registers BOTH (Company,Product,Type) AND (Company,Type,Product) to tolerate Excel/CSV swaps
+    """
+    url = (st.secrets.get("IMAGE_MANIFEST_URL", "") or "").strip()
+    text = ""
+    rows = []
+
+    try:
+        if url:
+            r = requests.get(url, timeout=30)
+            r.raise_for_status()
+            text = r.content.decode("utf-8-sig", errors="replace")
+        elif LOCAL_MANIFEST.exists():
+            text = LOCAL_MANIFEST.read_text(encoding="utf-8-sig", errors="replace")
+        else:
+            return {}
+    except Exception:
+        return {}
+
+    # Delimiter sniff
+    try:
+        dialect = csv.Sniffer().sniff(text.splitlines()[0])
+        delim = dialect.delimiter
+    except Exception:
+        delim = ","
+    reader = csv.DictReader(text.splitlines(), delimiter=delim)
+
+    def ci(row, name):
+        name = name.lower()
+        for k, v in row.items():
+            if (k or "").strip().lower() == name:
+                return v
+        return ""
+
+    def _clean_url(u: str) -> str:
+        u = (u or "").strip()
+        if u.lower().endswith((".jpg/", ".jpeg/", ".png/", ".webp/")):
+            u = u[:-1]
+        return u
+
+    manifest = {}
+    for r in reader:
+        c = _norm(ci(r, "company"))
+        p = _norm(ci(r, "product"))
+        t = _norm(ci(r, "type"))
+        urls = [_clean_url(u) for u in (ci(r, "imageurls") or "").split("|") if _clean_url(u)]
+        if c and p and t and urls:
+            # exact key
+            manifest[(c, p, t)] = urls
+            # swapped key to tolerate Excel vs CSV mismatch
+            manifest[(c, t, p)] = urls
+
+    return manifest
+
+
+MANIFEST = load_manifest()
+# ---- CASE-INSENSITIVE + SPACE-NORMALIZED HELPERS ----
+st.caption(f"Manifest keys loaded: {len(MANIFEST) if MANIFEST else 0}")
 # ------------------------------------------------------------------------------
 # Session state (UNCHANGED)
 # ------------------------------------------------------------------------------
@@ -127,26 +167,46 @@ if 'last_temp_key' not in st.session_state:
 # ------------------------------------------------------------------------------
 
 def get_image_list(company, product, ptype):
-    # normalized key
-    key_norm = (_norm(company), _norm(product), _norm(ptype))
+    """
+    Resolution order:
+      1) CSV manifest exact (incl. swapped key stored in MANIFEST)
+      2) Same (Company,Product) with soft Type (startswith/contains)
+      3) Token-overlap Type under same (Company,Product)
+      4) Any images for (Company,Product) ignoring Type
+      5) Local filesystem fallback images/Company/Product/Type/*
+    """
+    c_raw, p_raw, t_raw = company, product, ptype
+    c, p, t = _norm(c_raw), _norm(p_raw), _norm(t_raw)
 
-    # ---- Prefer manifest (URLs) with normalized matching ----
+    # ---- Manifest (URLs) ----
     if MANIFEST:
-        # exact normalized match
-        urls = MANIFEST.get(key_norm)
-        if urls:
-            return urls
+        # L0 exact (includes swapped)
+        if (c, p, t) in MANIFEST:
+            return MANIFEST[(c, p, t)]
 
-        # soft fallback: same company+product, type "starts with" or "contains" tolerance
-        # helps if Excel says "ceylon bench" and manifest has "Ceylon Bench (Oak)" etc.
-        for (c, p, t), urls in MANIFEST.items():
-            if c == key_norm[0] and p == key_norm[1]:
-                if t == key_norm[2] or t.startswith(key_norm[2]) or key_norm[2] in t:
-                    return urls
+        # L1 soft type (startswith / contains) under same (c,p)
+        for (mc, mp, mt), urls in MANIFEST.items():
+            if mc == c and mp == p and (mt == t or mt.startswith(t) or t in mt):
+                return urls
 
-    # ---- Local filesystem fallback (now case-insensitive) ----
-    # Only used if you actually keep images/ directory in the repo/server
-    folder = resolve_caseless_path(IMAGE_BASE, company, product, ptype)
+        # L2 token overlap on type
+        want = _tokens(t)
+        best, best_overlap = None, 0
+        for (mc, mp, mt), urls in MANIFEST.items():
+            if mc == c and mp == p:
+                ov = len(want & _tokens(mt))
+                if ov > best_overlap:
+                    best, best_overlap = urls, ov
+        if best and best_overlap > 0:
+            return best
+
+        # L3 any for (c,p) ignoring type
+        for (mc, mp, mt), urls in MANIFEST.items():
+            if mc == c and mp == p:
+                return urls
+
+    # ---- Local filesystem fallback (case-insensitive) ----
+    folder = resolve_caseless_path(IMAGE_BASE, c_raw, p_raw, t_raw)
     images = []
     if folder and folder.exists():
         for file in sorted(folder.iterdir()):
