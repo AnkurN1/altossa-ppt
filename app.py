@@ -55,9 +55,9 @@ def load_manifest():
         p = (r.get("Product") or "").strip()
         t = (r.get("Type") or "").strip()
         urls = [u.strip() for u in (r.get("ImageURLs") or "").split("|") if u.strip()]
-        if c and p and t and urls:
-            # store under normalized key
-            manifest[(_norm(c), _norm(p), _norm(t))] = urls
+        if not (c and p and t and urls):
+            continue
+        manifest[(_norm(c), _norm(p), _norm(t))] = urls  # <- uses _norm now defined above
     return manifest
 
 
@@ -67,7 +67,7 @@ import unicodedata
 from pathlib import Path
 
 def _norm(s: str) -> str:
-    """lowercase, trim, collapse internal spaces"""
+    """lowercase, trim, collapse spaces, NFKC normalize"""
     s = str(s or "")
     s = unicodedata.normalize("NFKC", s)
     return " ".join(s.strip().split()).lower()
