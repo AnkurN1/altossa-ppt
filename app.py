@@ -91,7 +91,9 @@ def load_manifest():
     Also registers a swapped (Product<->Type) key to tolerate mismatches
     between your Excel and CSV layouts.
     """
-    url = (st.secrets.get("IMAGE_MANIFEST_URL", "") or "").strip()
+    csv_text = st.secrets.get("IMAGE_MANIFEST_CSV", "")
+    if csv_text:
+        rows = list(csv.DictReader(csv_text.splitlines()))
     rows = []
     try:
         if url:
