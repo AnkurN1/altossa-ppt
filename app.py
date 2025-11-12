@@ -84,91 +84,51 @@ def load_excel(path: Path) -> pd.DataFrame:
     
 @st.cache_data(show_spinner=False)
 def load_manifest():
-    """
-    Loads CSV from st.secrets.IMAGE_MANIFEST_URL or local image_manifest.csv.
-    Handles BOM, CRLF/Mac newlines, and auto-detects delimiter.
-    Accepts headers in any case: company/product/type/imageurls.
-    Stores a debug dict in session_state for the Status panel.
-    """
+    import csv, requests
     url = (st.secrets.get("IMAGE_MANIFEST_URL", "") or "").strip()
+
+    def _clean_url(u: str) -> str:
+        u = (u or "").strip()
+        if u.lower().endswith((".jpg/", ".jpeg/", ".png/", ".webp/")):
+            u = u[:-1]
+        return u
+
     text = ""
-    debug = {
-        "source": "st.secrets URL" if url else ("local image_manifest.csv" if LOCAL_MANIFEST.exists() else "none"),
-        "http_status": None,
-        "text_len": 0,
-        "first_lines": [],
-        "header_fields": [],
-        "row_count": 0,
-        "keys_count": 0,
-        "error": None,
-        "used_delimiter": ",",
-    }
+    if url:
+        r = requests.get(url, timeout=30)
+        r.raise_for_status()
+        text = r.content.decode("utf-8-sig", errors="replace")
+    elif LOCAL_MANIFEST.exists():
+        text = LOCAL_MANIFEST.read_text(encoding="utf-8-sig", errors="replace")
+    else:
+        return {}
 
+    # Detect delimiter (comma default)
     try:
-        if url:
-            resp = requests.get(url, timeout=30)
-            debug["http_status"] = resp.status_code
-            resp.raise_for_status()
-            # decode with BOM handling
-            text = resp.content.decode("utf-8-sig", errors="replace")
-        elif LOCAL_MANIFEST.exists():
-            with open(LOCAL_MANIFEST, "rb") as f:
-                text = f.read().decode("utf-8-sig", errors="replace")
-        else:
-            st.session_state.manifest_debug = debug
-            return {}
+        dialect = csv.Sniffer().sniff(text.splitlines()[0])
+        delim = dialect.delimiter
+    except Exception:
+        delim = ","
 
-        debug["text_len"] = len(text)
-        debug["first_lines"] = (text.splitlines()[:3] if text else [])
+    rdr = csv.DictReader(text.splitlines(), delimiter=delim)
+    def ci(row, name):
+        name = name.lower()
+        for k, v in row.items():
+            if (k or "").strip().lower() == name:
+                return v
+        return ""
 
-        # Detect delimiter just in case (some editors export ; or \t)
-        sniffer = csv.Sniffer()
-        try:
-            dialect = sniffer.sniff(text.splitlines()[0] if text else "Company,Product,Type,ImageURLs")
-            delimiter = dialect.delimiter
-        except Exception:
-            delimiter = ","
-        debug["used_delimiter"] = delimiter
-
-        reader = csv.DictReader(text.splitlines(), delimiter=delimiter)
-        headers = [h.strip() for h in (reader.fieldnames or [])]
-        debug["header_fields"] = headers
-
-        # Case-insensitive header resolver
-        def get_ci(row, name):
-            for k, v in row.items():
-                if (k or "").strip().lower() == name:
-                    return v
-            return ""
-
-        def _clean_url(u: str) -> str:
-            u = (u or "").strip()
-            if u.lower().endswith((".jpg/", ".jpeg/", ".png/", ".webp/")):
-                u = u[:-1]
-            return u
-
-        manifest = {}
-        row_count = 0
-        for r in reader:
-            row_count += 1
-            c_raw = get_ci(r, "company")
-            p_raw = get_ci(r, "product")
-            t_raw = get_ci(r, "type")
-            urls_raw = get_ci(r, "imageurls")
-
-            c, p, t = _norm(c_raw), _norm(p_raw), _norm(t_raw)
-            urls = [_clean_url(u) for u in (urls_raw or "").split("|") if _clean_url(u)]
-
-            if c and p and t and urls:
-                # main key
-                manifest[(c, p, t)] = urls
-                # tolerant swapped key
-                manifest[(c, t, p)] = urls
-
-        debug["row_count"] = row_count
-        debug["keys_count"] = len(manifest)
-        st.session_state.manifest_debug = debug
-        return manifest
+    manifest = {}
+    for r in rdr:
+        c = _norm(ci(r, "company"))
+        p = _norm(ci(r, "product"))
+        t = _norm(ci(r, "type"))
+        urls = [_clean_url(u) for u in (ci(r, "imageurls") or "").split("|") if _clean_url(u)]
+        if c and p and t and urls:
+            manifest[(c, p, t)] = urls
+            # store swapped too (Product<->Type) to tolerate your Excel vs CSV mismatch
+            manifest[(c, t, p)] = urls
+    return manifest
 
     except Exception as e:
         debug["error"] = str(e)
@@ -184,57 +144,79 @@ MANIFEST = load_manifest()
 # IMAGE RESOLUTION (CSV/URL first, local images/ fallback)
 # --------------------------------------------------------------------------------------
 def get_image_list(company: str, product: str, ptype: str):
-    """Return image list for (Company, Product, Type), tolerant to Product/Type swap."""
-    c, p, t = _norm(company), _norm(product), _norm(ptype)
+    import difflib
+    c_raw, p_raw, t_raw = company, product, ptype
+    c, p, t = _norm(c_raw), _norm(p_raw), _norm(t_raw)
 
-    def _match_from_manifest(c, p, t):
-        # 1) Exact (includes swapped key thanks to load_manifest)
-        if (c, p, t) in MANIFEST:
-            return MANIFEST[(c, p, t)]
-
-        # 2) soft: startswith / contains (same c,p)
-        for (mc, mp, mt), urls in MANIFEST.items():
-            if mc == c and mp == p and (mt == t or mt.startswith(t) or t in mt):
-                return urls
-
-        # 3) token-based partial (same c,p)
-        t_tokens = _tokens(t)
-        best = None
-        best_overlap = 0
-        for (mc, mp, mt), urls in MANIFEST.items():
-            if mc == c and mp == p:
-                mt_tokens = _tokens(mt)
-                overlap = len(t_tokens & mt_tokens)
-                if overlap > best_overlap:
-                    best_overlap = overlap
-                    best = urls
-        if best and best_overlap > 0:
-            return best
-
-        # 4) fallback: any (c,p)
-        for (mc, mp, mt), urls in MANIFEST.items():
-            if mc == c and mp == p:
-                return urls
+    if not MANIFEST:
         return []
 
-    # Try normal ordering
-    urls = _match_from_manifest(c, p, t)
-    if urls:
-        return urls
+    # L0 exact (includes swapped key stored during load)
+    if (c, p, t) in MANIFEST:
+        return MANIFEST[(c, p, t)]
 
-    # As an extra safety net, try reading Type/Product swapped (helps when Excel is flipped)
-    urls = _match_from_manifest(c, t, p)
-    if urls:
-        return urls
+    # L1 same company+product, soft type
+    for (mc, mp, mt), urls in MANIFEST.items():
+        if mc == c and mp == p and (mt == t or mt.startswith(t) or t in mt):
+            return urls
 
-    # Local filesystem fallback (case-insensitive): images/Company/Product/Type/*
-    folder = resolve_caseless_path(IMAGE_BASE, company, product, ptype)
-    images = []
+    # L2 token overlap on type (same company+product)
+    t_tok = _tokens(t)
+    best, best_overlap = None, 0
+    for (mc, mp, mt), urls in MANIFEST.items():
+        if mc == c and mp == p:
+            overlap = len(t_tok & _tokens(mt))
+            if overlap > best_overlap:
+                best, best_overlap = urls, overlap
+    if best and best_overlap > 0:
+        return best
+
+    # L3 any (company, product) ignoring type entirely
+    for (mc, mp, mt), urls in MANIFEST.items():
+        if mc == c and mp == p:
+            return urls
+
+    # L4 fuzzy product within company
+    products = sorted({mp for (mc, mp, mt) in MANIFEST.keys() if mc == c})
+    for fp in difflib.get_close_matches(p, products, n=1, cutoff=0.6):
+        if (c, fp, t) in MANIFEST:
+            return MANIFEST[(c, fp, t)]
+        for (mc, mp, mt), urls in MANIFEST.items():
+            if mc == c and mp == fp:
+                return urls
+
+    # L5 fuzzy company + product
+    companies = sorted({mc for (mc, mp, mt) in MANIFEST.keys()})
+    for fc in difflib.get_close_matches(c, companies, n=1, cutoff=0.6):
+        fprods = sorted({mp for (mc, mp, mt) in MANIFEST.keys() if mc == fc})
+        for fp in difflib.get_close_matches(p, fprods, n=1, cutoff=0.6):
+            if (fc, fp, t) in MANIFEST:
+                return MANIFEST[(fc, fp, t)]
+            for (mc, mp, mt), urls in MANIFEST.items():
+                if mc == fc and mp == fp:
+                    return urls
+
+    # L6 wide token scan within company (handles things like "Complements" vs "abside")
+    want = _tokens(p) | _tokens(t)
+    best, best_score = None, 0
+    for (mc, mp, mt), urls in MANIFEST.items():
+        if mc != c:
+            continue
+        score = len(want & (_tokens(mp) | _tokens(mt)))
+        if score > best_score:
+            best, best_score = urls, score
+    if best and best_score > 0:
+        return best
+
+    # L7 local filesystem fallback: images/Company/Product/Type/*
+    folder = resolve_caseless_path(IMAGE_BASE, c_raw, p_raw, t_raw)
+    imgs = []
     if folder and folder.exists():
-        for file in sorted(folder.iterdir()):
-            if file.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp"):
-                images.append(str(file))
-    return images
+        for f in sorted(folder.iterdir()):
+            if f.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp"):
+                imgs.append(str(f))
+    return imgs
+
 
 # --------------------------------------------------------------------------------------
 # PPT CREATION (unchanged styling)
@@ -425,7 +407,15 @@ if search_query:
                     "company": company, "product": product, "link": link, "images": selected_imgs
                 }
         else:
-            st.info(f"No images found for this type.\n\nTried keys like:\n• Exact: ({_norm(company)}, {_norm(product)}, {_norm(ptype)})\n• Soft / token match variations.\n\nIf using CSV, ensure a row exists with these three columns matching and URLs in ImageURLs.")
+            st.info(
+    "No images found for this type.\n\n"
+    f"Tried normalized key: ({_norm(company)}, {_norm(product)}, {_norm(ptype)})\n"
+    "Troubleshooting:\n"
+    "• If you use a CSV/URL manifest, add a row with columns: Company, Product, Type, ImageURLs\n"
+    "• Ensure values match exactly after normalization (case-insensitive, spaces collapsed)\n"
+    "• Or place files under images/Company/Product/Type/*.jpg|png"
+)
+
 else:
     company = st.selectbox("Select Company", sorted(DATA['Company'].dropna().unique()), key="company")
     products = sorted(DATA[DATA['Company'] == company]['Product'].dropna().unique())
