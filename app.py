@@ -151,7 +151,7 @@ def load_manifest():
 
 MANIFEST = load_manifest()
 # ---- CASE-INSENSITIVE + SPACE-NORMALIZED HELPERS ----
-st.caption(f"Manifest keys loaded: {len(MANIFEST) if MANIFEST else 0}")
+# st.caption(f"Manifest keys loaded: {len(MANIFEST) if MANIFEST else 0}")
 # ------------------------------------------------------------------------------
 # Session state (UNCHANGED)
 # ------------------------------------------------------------------------------
