@@ -63,45 +63,6 @@ def resolve_caseless_path(base_dir: str | Path, *segments: str) -> Path | None:
         cur = nxt
     return cur
 
-
-
-@st.cache_data(show_spinner=False)
-def load_manifest():
-    """
-    Manifest CSV columns: Company,Product,Type,ImageURLs
-    ImageURLs is '|' separated list of absolute URLs (R2 public links)
-    """
-    url = (st.secrets.get("IMAGE_MANIFEST_URL", "") or "").strip()
-    rows = []
-    try:
-        if url:
-            txt = requests.get(url, timeout=30).text.splitlines()
-            reader = csv.DictReader(txt)
-            rows = list(reader)
-        elif LOCAL_MANIFEST.exists():
-            with open(LOCAL_MANIFEST, newline="", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                rows = list(reader)
-    except Exception:
-        rows = []
-
-    manifest = {}
-    for r in rows:
-        c = (r.get("Company") or "").strip()
-        p = (r.get("Product") or "").strip()
-        t = (r.get("Type") or "").strip()
-        urls = [u.strip() for u in (r.get("ImageURLs") or "").split("|") if u.strip()]
-        if not (c and p and t and urls):
-            continue
-        manifest[(_norm(c), _norm(p), _norm(t))] = urls  # <- uses _norm now defined above
-    return manifest
-
-
-MANIFEST = load_manifest()
-# ---- CASE-INSENSITIVE + SPACE-NORMALIZED HELPERS ----
-
-
-
 def show_image_safe(src):
     try:
         s = str(src).strip()
@@ -117,6 +78,22 @@ def show_image_safe(src):
         st.image(img, use_column_width=True)
     except Exception as e:
         st.caption(f"⚠️ Failed to preview image ({src}): {e}")
+
+def fetch_to_tempfile(path_or_url: str) -> str:
+    """Return local path for python-pptx: download if URL, else pass-through."""
+    if "://" not in str(path_or_url):
+        return path_or_url
+    resp = requests.get(path_or_url, timeout=60)
+    resp.raise_for_status()
+    ext = ".png" if path_or_url.lower().endswith(".png") else ".jpg"
+    fd, tpath = tempfile.mkstemp(suffix=ext)
+    with os.fdopen(fd, "wb") as f:
+        f.write(resp.content)
+    return tpath
+    
+
+# ---- CASE-INSENSITIVE + SPACE-NORMALIZED HELPERS ----
+
 # ------------------------------------------------------------------------------
 # Session state (UNCHANGED)
 # ------------------------------------------------------------------------------
@@ -181,18 +158,41 @@ def open_pil_image(path_or_url):
         return Image.open(io.BytesIO(resp.content))
     return Image.open(path_or_url)
 
-# NEW: for python-pptx add_picture() which needs a path/stream; easiest is temp file
-def fetch_to_tempfile(path_or_url):
-    if "://" not in str(path_or_url):
-        return path_or_url
-    resp = requests.get(path_or_url, timeout=60)
-    resp.raise_for_status()
-    # infer ext from URL
-    ext = ".png" if path_or_url.lower().endswith(".png") else ".jpg"
-    fd, tpath = tempfile.mkstemp(suffix=ext)
-    with os.fdopen(fd, "wb") as f:
-        f.write(resp.content)
-    return tpath
+
+@st.cache_data(show_spinner=False)
+def load_manifest():
+    """
+    Manifest CSV columns: Company,Product,Type,ImageURLs
+    ImageURLs is '|' separated list of absolute URLs (R2 public links)
+    """
+    url = (st.secrets.get("IMAGE_MANIFEST_URL", "") or "").strip()
+    rows = []
+    try:
+        if url:
+            txt = requests.get(url, timeout=30).text.splitlines()
+            reader = csv.DictReader(txt)
+            rows = list(reader)
+        elif LOCAL_MANIFEST.exists():
+            with open(LOCAL_MANIFEST, newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                rows = list(reader)
+    except Exception:
+        rows = []
+
+    manifest = {}
+    for r in rows:
+        c = (r.get("Company") or "").strip()
+        p = (r.get("Product") or "").strip()
+        t = (r.get("Type") or "").strip()
+        urls = [u.strip() for u in (r.get("ImageURLs") or "").split("|") if u.strip()]
+        if not (c and p and t and urls):
+            continue
+        manifest[(_norm(c), _norm(p), _norm(t))] = urls  # <- uses _norm now defined above
+    return manifest
+
+
+MANIFEST = load_manifest()
+
 
 def create_beautiful_ppt(slide_data_list, include_intro_outro=True):
     prs = Presentation()
