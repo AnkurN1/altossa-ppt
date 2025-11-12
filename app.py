@@ -88,7 +88,8 @@ def load_manifest():
     Manifest CSV columns:
       Company, Product, Type, ImageURLs
     ImageURLs is '|' separated list of absolute URLs.
-    Prefer URL via st.secrets.IMAGE_MANIFEST_URL, else local image_manifest.csv, else {}.
+    Also registers a swapped (Product<->Type) key to tolerate mismatches
+    between your Excel and CSV layouts.
     """
     url = (st.secrets.get("IMAGE_MANIFEST_URL", "") or "").strip()
     rows = []
@@ -96,7 +97,6 @@ def load_manifest():
         if url:
             resp = requests.get(url, timeout=30)
             resp.raise_for_status()
-            # DictReader accepts list of lines
             rows = list(csv.DictReader(resp.text.splitlines()))
         elif LOCAL_MANIFEST.exists():
             with open(LOCAL_MANIFEST, newline="", encoding="utf-8") as f:
@@ -104,15 +104,25 @@ def load_manifest():
     except Exception as e:
         st.warning(f"Could not load image manifest: {e}")
 
+    def _clean_url(u: str) -> str:
+        u = (u or "").strip()
+        # strip accidental trailing slash after extension
+        if u.lower().endswith((".jpg/", ".jpeg/", ".png/", ".webp/")):
+            u = u[:-1]
+        return u
+
     manifest = {}
     for r in rows:
-        c = _norm(r.get("Company", ""))
-        p = _norm(r.get("Product", ""))
-        t = _norm(r.get("Type", ""))
-        urls = [u.strip() for u in (r.get("ImageURLs") or "").split("|") if u.strip()]
+        c_raw, p_raw, t_raw = r.get("Company", ""), r.get("Product", ""), r.get("Type", "")
+        c, p, t = _norm(c_raw), _norm(p_raw), _norm(t_raw)
+        urls = [ _clean_url(u) for u in (r.get("ImageURLs") or "").split("|") if _clean_url(u) ]
         if c and p and t and urls:
+            # main key
             manifest[(c, p, t)] = urls
+            # tolerant swapped key (handles CSV vs Excel column mismatch)
+            manifest[(c, t, p)] = urls
     return manifest
+
 
 DATA = load_excel(EXCEL_PATH)
 MANIFEST = load_manifest()
@@ -121,18 +131,11 @@ MANIFEST = load_manifest()
 # IMAGE RESOLUTION (CSV/URL first, local images/ fallback)
 # --------------------------------------------------------------------------------------
 def get_image_list(company: str, product: str, ptype: str):
-    """Return a list of image URLs/paths for (Company, Product, Type).
-       Tries:
-        1) Manifest exact key
-        2) Manifest soft type match (startswith / contains)
-        3) Manifest token-based partial match
-        4) Manifest fallback: any type under same (Company, Product)
-        5) Local filesystem (case-insensitive): images/Company/Product/Type/*
-    """
+    """Return image list for (Company, Product, Type), tolerant to Product/Type swap."""
     c, p, t = _norm(company), _norm(product), _norm(ptype)
 
-    # 1) Exact
-    if MANIFEST:
+    def _match_from_manifest(c, p, t):
+        # 1) Exact (includes swapped key thanks to load_manifest)
         if (c, p, t) in MANIFEST:
             return MANIFEST[(c, p, t)]
 
@@ -141,7 +144,7 @@ def get_image_list(company: str, product: str, ptype: str):
             if mc == c and mp == p and (mt == t or mt.startswith(t) or t in mt):
                 return urls
 
-        # 3) token-based partial
+        # 3) token-based partial (same c,p)
         t_tokens = _tokens(t)
         best = None
         best_overlap = 0
@@ -155,12 +158,23 @@ def get_image_list(company: str, product: str, ptype: str):
         if best and best_overlap > 0:
             return best
 
-        # 4) fallback to any images for the product
+        # 4) fallback: any (c,p)
         for (mc, mp, mt), urls in MANIFEST.items():
             if mc == c and mp == p:
                 return urls
+        return []
 
-    # 5) Local filesystem fallback
+    # Try normal ordering
+    urls = _match_from_manifest(c, p, t)
+    if urls:
+        return urls
+
+    # As an extra safety net, try reading Type/Product swapped (helps when Excel is flipped)
+    urls = _match_from_manifest(c, t, p)
+    if urls:
+        return urls
+
+    # Local filesystem fallback (case-insensitive): images/Company/Product/Type/*
     folder = resolve_caseless_path(IMAGE_BASE, company, product, ptype)
     images = []
     if folder and folder.exists():
