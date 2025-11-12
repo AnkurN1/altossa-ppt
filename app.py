@@ -29,6 +29,42 @@ LAST_PATH  = Path("static/img/last.png")
 BASE_DIR = Path(__file__).parent
 LOCAL_MANIFEST = BASE_DIR / "image_manifest.csv"
 
+
+
+import unicodedata
+from pathlib import Path
+
+def _norm(s: str) -> str:
+    """lowercase, trim, collapse spaces, NFKC normalize"""
+    s = str(s or "")
+    s = unicodedata.normalize("NFKC", s)
+    return " ".join(s.strip().split()).lower()
+
+def _child_caseless(parent: Path, wanted: str) -> Path | None:
+    """Find child folder ignoring case/extra spaces."""
+    wanted_n = _norm(wanted)
+    if not parent.exists() or not parent.is_dir():
+        return None
+    for p in parent.iterdir():
+        try:
+            if p.is_dir() and _norm(p.name) == wanted_n:
+                return p
+        except Exception:
+            continue
+    return None
+
+def resolve_caseless_path(base_dir: str | Path, *segments: str) -> Path | None:
+    """Walk down a folder tree case-insensitively."""
+    cur = Path(base_dir)
+    for seg in segments:
+        nxt = _child_caseless(cur, seg)
+        if nxt is None:
+            return None
+        cur = nxt
+    return cur
+
+
+
 @st.cache_data(show_spinner=False)
 def load_manifest():
     """
@@ -63,37 +99,6 @@ def load_manifest():
 
 MANIFEST = load_manifest()
 # ---- CASE-INSENSITIVE + SPACE-NORMALIZED HELPERS ----
-import unicodedata
-from pathlib import Path
-
-def _norm(s: str) -> str:
-    """lowercase, trim, collapse spaces, NFKC normalize"""
-    s = str(s or "")
-    s = unicodedata.normalize("NFKC", s)
-    return " ".join(s.strip().split()).lower()
-
-def _child_caseless(parent: Path, wanted: str) -> Path | None:
-    """Find child folder ignoring case/extra spaces."""
-    wanted_n = _norm(wanted)
-    if not parent.exists() or not parent.is_dir():
-        return None
-    for p in parent.iterdir():
-        try:
-            if p.is_dir() and _norm(p.name) == wanted_n:
-                return p
-        except Exception:
-            continue
-    return None
-
-def resolve_caseless_path(base_dir: str | Path, *segments: str) -> Path | None:
-    """Walk down a folder tree case-insensitively."""
-    cur = Path(base_dir)
-    for seg in segments:
-        nxt = _child_caseless(cur, seg)
-        if nxt is None:
-            return None
-        cur = nxt
-    return cur
 
 
 
